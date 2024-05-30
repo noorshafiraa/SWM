@@ -1,0 +1,4 @@
+functions-framework==3.*
+mysql-connector==2.2.9
+requests==2.25.1
+pytz
