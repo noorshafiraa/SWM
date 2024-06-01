@@ -7,8 +7,9 @@ import struct
 import requests
 import pytz
 
-# Set the timezone to ICT
-ict_timezone = pytz.timezone('Asia/Bangkok')
+# Set the timezone to wit (western indonesia time) and utc
+utcTime = pytz.utc
+witTime = pytz.timezone("Asia/Jakarta")
 
 # MySQL server
 db_config = {
@@ -55,7 +56,7 @@ def downlink():
     
     # Calculate the current time in seconds then to hex
     # Get the current time in ICT timezone
-    current_timeD = datetime.now(ict_timezone)
+    current_timeD = datetime.now(witTime)
     downlinkData = current_timeD.hour * 3600 + current_timeD.minute * 60 + current_timeD.second
     print(downlinkData)
     hex_time = f"{downlinkData:08x}"  # Remove the '0x' prefix
@@ -66,7 +67,7 @@ def downlink():
         }
     }
 
-    response_downlink = requests.post(urlSRE, headers=headersSRE, json=dataDownlink)
+    response_downlink = requests.post(urlTA, headers=headersTA, json=dataDownlink)
 
     print(f"Status Code: {response_downlink.status_code}")
     print(f"Response Body: {response_downlink.json()}")
@@ -76,115 +77,128 @@ def update_data_cumulative(new_cumul_consump, perangkat_id_, tamper_flag_):
         # Acquire connection from the pool
         connection = pool.get_connection()
 
-        # For newMonth identification
-        newMonth = 0
         if connection.is_connected():
             print("Connected to MySQL server")
-            
+
             # Create a buffered cursor
             cursor = connection.cursor(buffered=True)
 
-            ## Check for data entries in the last 30 seconds or current day for the same perangkat_id
-            thirty_seconds_ago = datetime.now() - timedelta(seconds=30)
-            # Get the start of today's date
-            today_data = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            ## Validate perangkat_id
+            select_query = f"SELECT cumul_consump FROM konsumsi_kumulatif WHERE Perangkat_id = '{perangkat_id_}'"
+            cursor.execute(select_query)
+            result = cursor.fetchone()
+
+            if result is None:
+                print(f"No entry found for perangkat_id {perangkat_id_} in konsumsi_kumulatif table. Skipping update.")
+                return  # Exit the function if no entry found
+
+            # Do Downlink
+            downlink()
+
+            prev_cumul = result[0] if result[0] is not None else 0
+            daily_consump = new_cumul_consump - prev_cumul
+
+            ## Check for data entries in the last 1 minute for the same perangkat_id
+            one_min_ago = datetime.now(utcTime) - timedelta(minutes=1)
             check_query = """
                 SELECT COUNT(*)
                 FROM konsumsi_harian
                 WHERE Perangkat_id = %s AND waktu_diterima >= %s
             """
-            cursor.execute(check_query, (perangkat_id_, today_data))
+            cursor.execute(check_query, (perangkat_id_, one_min_ago))
             data_count = cursor.fetchone()[0]
 
             if data_count > 0:
-                print(f"There are {data_count} data entries for perangkat_id {perangkat_id_} in the last 30 seconds. No update will be performed.")
-                return  # Exit the function if there are data entries in the last 30 seconds
+                print(f"There are {data_count} data entries for perangkat_id {perangkat_id_} in the last 1 minute. No update will be performed.")
+                return  # Exit the function if there are data entries in the last 1 minute
 
-            print(f"No data entries for perangkat_id {perangkat_id_} in the last 30 seconds. Proceeding with update.")
+            ## Check for data entries from 10:30:00 yesterday to 00:29:59 today
+            today_date = datetime.now(utcTime).date()
+            start_time = datetime.combine(today_date, datetime.min.time()).replace(hour=10, minute=30, second=0, microsecond=0) - timedelta(days=1)
+            end_time = datetime.combine(today_date, datetime.min.time()).replace(hour=0, minute=29, second=59, microsecond=0)
+            check_query = """
+                SELECT daily_consump
+                FROM konsumsi_harian
+                WHERE Perangkat_id = %s AND waktu_diterima BETWEEN %s AND %s
+            """
+            cursor.execute(check_query, (perangkat_id_, start_time, end_time))
+            data = cursor.fetchone()
 
-            ## Check the stat. Update waktu_casing only if flag_tamper = 1.
+            if data:
+                # There is a data entry in the specified time range
+                current_daily_consump = data[0]
+                new_daily_consump = current_daily_consump + daily_consump
+                update_query = """
+                    UPDATE konsumsi_harian 
+                    SET daily_consump = %s, waktu_diterima = %s 
+                    WHERE Perangkat_id = %s AND waktu_diterima BETWEEN %s AND %s
+                """
+                cursor.execute(update_query, (new_daily_consump, datetime.now(utcTime), perangkat_id_, start_time, end_time))
+            else:
+                # No data entries in the specified time range
+                insert_query = """
+                    INSERT INTO konsumsi_harian (Perangkat_id, waktu_diterima, daily_consump) 
+                    VALUES (%s, %s, %s)
+                """
+                cursor.execute(insert_query, (perangkat_id_, datetime.now(utcTime), daily_consump))
+
+            # Update the cumulative consumption in konsumsi_kumulatif table
+            update_query = "UPDATE konsumsi_kumulatif SET cumul_consump = %s WHERE Perangkat_id = %s"
+            cursor.execute(update_query, (new_cumul_consump, perangkat_id_))
+
+            # Check the tamper flag and update stat_perangkat table
             if tamper_flag_ == 1:
-                # Insert Data to the stat_perangkat table
-                result_time = datetime.now()
                 update_query = "UPDATE stat_perangkat SET stat_casing = %s, waktu_casing = %s WHERE Perangkat_id = %s"
-                update_data = (tamper_flag_,result_time,perangkat_id_)
-                cursor.execute(update_query, update_data)
+                cursor.execute(update_query, (tamper_flag_, datetime.now(utcTime), perangkat_id_))
             else:
                 update_query = "UPDATE stat_perangkat SET stat_casing = %s WHERE Perangkat_id = %s"
-                update_data = (tamper_flag_, perangkat_id_)
-                cursor.execute(update_query, update_data)
-            
-            ## Get the current cumulative consumption
-            # Build the SELECT query
-            select_query = f"SELECT cumul_consump FROM konsumsi_kumulatif WHERE Perangkat_id = '{perangkat_id_}'"
-            # Execute the SELECT query
-            cursor.execute(select_query)
-            # Fetch the result
-            result = cursor.fetchone()
+                cursor.execute(update_query, (tamper_flag_, perangkat_id_))
 
-            if result[0] is not None:
-                daily_consump = new_cumul_consump - result[0]
-            else:
-                daily_consump = new_cumul_consump
-
-            ## Get the current monthly consumption
-            # Build the SELECT query
+            # Get the current monthly consumption
             select_query = f"""
                 SELECT month_consump
                 FROM konsumsi_bulanan
                 WHERE Perangkat_id = '{perangkat_id_}'
                 AND MM = MONTH(NOW()) AND YY = YEAR(NOW());
             """
-            # Execute the SELECT query
             cursor.execute(select_query)
-            # Fetch the result
             result = cursor.fetchone()
 
             if result is not None:
                 newMonth = 0
                 monthly_consump = daily_consump + result[0]
             else:
-                # The month has change
+                # The month has changed
                 newMonth = 1
                 monthly_consump = daily_consump
 
-            ## Update the table database
-            # Insert Data to the konsumsi_kumulatif table
-            update_query = "UPDATE konsumsi_kumulatif SET cumul_consump = %s WHERE Perangkat_id = %s"
-            update_data = (new_cumul_consump, perangkat_id_)
-            cursor.execute(update_query, update_data)
-
-            # Insert Data to konsumsi_harian table
-            current_timestamp = datetime.now()
-            current_month = current_timestamp.month
-            current_year = current_timestamp.year   
-
-            update_query = "INSERT INTO konsumsi_harian (Perangkat_id, waktu_diterima, daily_consump) VALUES (%s, %s, %s)"
-            update_data = (perangkat_id_, current_timestamp, daily_consump)
-            cursor.execute(update_query, update_data)
-
-            # Insert Data to konsumsi_bulanan table
-            if newMonth == 1: # New month, insert new row
-                update_query = "INSERT INTO konsumsi_bulanan (Perangkat_id, MM, YY, month_consump) VALUES (%s, %s, %s, %s)"
-                update_data = (perangkat_id_, current_month, current_year, monthly_consump)
-                cursor.execute(update_query, update_data)
+            # Update the konsumsi_bulanan table
+            if newMonth == 1:  # New month, insert new row
+                insert_query = """
+                    INSERT INTO konsumsi_bulanan (Perangkat_id, MM, YY, month_consump) 
+                    VALUES (%s, %s, %s, %s)
+                """
+                cursor.execute(insert_query, (perangkat_id_, datetime.now(utcTime).month, datetime.now(utcTime).year, monthly_consump))
             else:
-                update_query = "UPDATE konsumsi_bulanan SET month_consump = %s WHERE Perangkat_id = %s AND MM = %s AND YY = %s"
-                update_data = (monthly_consump, perangkat_id_, current_month, current_year)
-                cursor.execute(update_query, update_data)
-
+                update_query = """
+                    UPDATE konsumsi_bulanan 
+                    SET month_consump = %s 
+                    WHERE Perangkat_id = %s AND MM = %s AND YY = %s
+                """
+                cursor.execute(update_query, (monthly_consump, perangkat_id_, datetime.now(utcTime).month, datetime.now(utcTime).year))
 
             # Commit the changes
             connection.commit()
 
     except sql.Error as err:
         print(f"Error: {err}")
-    
+
     finally:
         if connection.is_connected():
             cursor.close()
             connection.close()
             print("MySQL connection closed")
+
 
 def update_force_data(konsumsiAir, perangkat_id_, tamper_flag_):
     try:
@@ -199,7 +213,7 @@ def update_force_data(konsumsiAir, perangkat_id_, tamper_flag_):
             ## Check the stat. Update waktu_casing only if flag_tamper = 1.
             if tamper_flag_ == 1:
                 # Insert Data to the stat_perangkat table
-                result_time = datetime.now()
+                result_time = datetime.now(utcTime)
                 update_query = "UPDATE stat_perangkat SET stat_casing = %s, waktu_casing = %s WHERE Perangkat_id = %s"
                 update_data = (tamper_flag_,result_time,perangkat_id_)
                 cursor.execute(update_query, update_data)
@@ -209,10 +223,24 @@ def update_force_data(konsumsiAir, perangkat_id_, tamper_flag_):
                 cursor.execute(update_query, update_data)
 
             # Insert Data to the force_data table
-            result_time = datetime.now()
+            result_time = datetime.now(utcTime)
             update_query = "UPDATE force_data SET force_consump = %s, waktu_diterima = %s, stat_casing = %s  WHERE Perangkat_id = %s"
             update_data = (konsumsiAir, result_time, tamper_flag_, perangkat_id_)
             cursor.execute(update_query, update_data)
+
+            ## Get the current cumulative consumption
+            select_query = f"SELECT cumul_consump FROM konsumsi_kumulatif WHERE Perangkat_id = '{perangkat_id_}'"
+            # Execute the SELECT query
+            cursor.execute(select_query)
+            # Fetch the result
+            result = cursor.fetchone()
+
+            if result is None:
+                print(f"No entry found for perangkat_id {perangkat_id_} in konsumsi_kumulatif table. Skipping update.")
+                return  # Exit the function if no entry found
+
+            else:
+                downlink()
 
             # Commit the changes
             connection.commit()
@@ -328,8 +356,6 @@ def main(request):
 
     # Process the input
     if input_type == 0:
-        downlink()
-
         # Process force data
         result = parse_force_data(input)
         print("Parsed Data:")
@@ -337,15 +363,16 @@ def main(request):
         update_force_data(result["konsumsi_air"], result["perangkat_id"], result["tamper_flag"])
         return "force data perangkat berhasil diproses!",200
 
-    elif input_type == 1:
-        downlink()
-        
+    elif input_type == 1:       
         # Process periodic data
         result = parse_periodic_data(input)
         print("Parsed Data:")
         print(result)
         update_data_cumulative(result["konsumsi_air"], result["perangkat_id"], result["tamper_flag"])
         return "Periodic data perangkat berhasil diproses!",200
+    else:
+        print(input)
+        return "Input not supported", 200
     else:
         print(input)
         return "Input not supported", 200
