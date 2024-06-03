@@ -1,2 +1,2 @@
 LoRaWAN-Arduino-Library -- From Antares
-TA232401006             -- Source code for LoRa, sleep mode, and UART 
+TA232401006             -- Source code for LoRa, sleep mode, and UART. Uses the above library
